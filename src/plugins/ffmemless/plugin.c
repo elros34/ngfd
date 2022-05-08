@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <stdbool.h>
 #include <ngf/plugin.h>
 #include <ngf/haptic.h>
 #include <linux/input.h>
@@ -64,11 +66,13 @@ struct ffm_effect_data {
 	guint playback_time;
 	int poll_id;
 	int16_t customEffectId;
+	bool fixed_time;
 	struct ff_effect cached_effect;
 };
 
 static struct ffm_data {
 	int 		dev_file;
+	int         enable_file;
 	const NProplist *ngfd_props;
 	NProplist *sys_props;
 	GHashTable	*effects;
@@ -231,6 +235,7 @@ static GHashTable *ffm_new_effect_list(const char *effect_data)
 		data = g_new0(struct ffm_effect_data, 1);
 		data->id = -1;
 		data->repeat = 1;
+                data->fixed_time = FALSE;
 		g_hash_table_insert(list, strdup(effect_names[i]), data);
 	}
 
@@ -252,6 +257,7 @@ static int ffm_setup_default_effect(GHashTable *effects, int dev_fd)
 	if (!data) {
 		data = g_new0(struct ffm_effect_data, 1);
 		data->id = 1;
+                data->fixed_time = FALSE;
 		ff.id = -1;
 		g_hash_table_insert(effects, g_strdup(N_HAPTIC_EFFECT_DEFAULT),
 				data);
@@ -321,6 +327,7 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 		memset(&ff, 0, sizeof(struct ff_effect));
 		int16_t custom_data[CUSTOM_DATA_LEN] = {0, 0, 0};
 		N_DEBUG (LOG_CAT "got key %s, id %d", key, data->id);
+                data->fixed_time = FALSE;
 
 		value = ffm_get_str_value(props, key, "_TYPE");
 		if (!value) {
@@ -380,6 +387,13 @@ static int ffm_setup_effects(const NProplist *props, GHashTable *effects)
 		if (ff.type == FF_RUMBLE) {
 			N_DEBUG (LOG_CAT "rumble effect");
 			ff.type = FF_RUMBLE;
+
+                        if (ff.replay.length <= 40 && data->repeat == 1) {
+                            data->fixed_time = TRUE;
+                            data->playback_time = ff.replay.length;
+                            N_DEBUG(LOG_CAT "Fixed time effect");
+                            continue;
+                        }
 
 			ff.u.rumble.strong_magnitude = ffm_get_int_value(props,
 				key, "_MAGNITUDE", 0, UINT16_MAX);
@@ -557,6 +571,20 @@ gboolean ffm_playback_done(gpointer userdata)
 	return FALSE;
 }
 
+static int vibra_enable(int msec)
+{
+    int bytes_written;
+    char buff[6];
+
+    if (ffm.enable_file < 0)
+        return -1;
+
+    bytes_written = snprintf(buff, 6, "%d", msec * 1000);
+    if (write(ffm.enable_file, buff, bytes_written) == -1)
+        return -1;
+    return 0;
+}
+
 static int ffm_play(struct ffm_effect_data *data, int play)
 {
 	data->poll_id = 0;
@@ -569,9 +597,18 @@ static int ffm_play(struct ffm_effect_data *data, int play)
 						ffm_playback_done, data);
 		}
 		N_DEBUG (LOG_CAT "Starting playback %d", data->id);
+		
+		if (data->fixed_time) {
+            if (vibra_enable(data->playback_time))
+                return FALSE;
+            else return TRUE;
+        }
 	} else {
 		ffm_playback_done(data);
 		N_DEBUG (LOG_CAT "Stopping playback %d", data->id);
+		
+        if (data->fixed_time)
+            return TRUE;
 	}
 
 	if (ffm.cache_effects) {
@@ -607,6 +644,7 @@ static void ffm_sink_shutdown(NSinkInterface *iface)
 	(void) iface;
 	g_hash_table_destroy(ffm.effects);
 	ffm_close_device(ffm.dev_file);
+	ffm_close_device(ffm.enable_file);
 }
 
 static int ffm_sink_initialize(NSinkInterface *iface)
@@ -617,6 +655,12 @@ static int ffm_sink_initialize(NSinkInterface *iface)
 		N_ERROR (LOG_CAT "Could not find a device file");
 		goto ffm_init_error1;
 	}
+
+        ffm.enable_file = open("/sys/module/board_mmi_vibrator/parameters/enable_us", O_WRONLY);
+        if (ffm.enable_file < 0) {
+            N_DEBUG(LOG_CAT "Failed to open enable_us");
+            return FALSE;
+        }
 
 	ffm.effects = ffm_new_effect_list(n_proplist_get_string(ffm.ngfd_props,
 							FFM_EFFECTLIST_KEY));
@@ -710,9 +754,9 @@ static int ffm_sink_play(NSinkInterface *iface, NRequest *request)
 
 	data = (struct ffm_effect_data *)n_request_get_data (request, FFM_KEY);
 
-	N_DEBUG (LOG_CAT "play id %d, repeat %d times, iface 0x%x, "
+        N_DEBUG (LOG_CAT "play id %d, repeat %d times, iface 0x%x, fixed %d, "
 			 "req 0x%x data 0x%x", data->id, data->repeat,
-			data->iface, data->request, data);
+                        data->iface, data->fixed_time, data->request, data);
 
 	return ffm_play(data, data->repeat);
 }
